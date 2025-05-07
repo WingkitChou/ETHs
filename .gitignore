@@ -1,0 +1,14 @@
+__pycache__
+TODO.png
+README.png
+config/
+weights/
+tables/
+images/*
+!images/readme/
+!images/readme/*
+videos/
+equations/video/
+*.zip
+cookie.json
+*.js
