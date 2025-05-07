@@ -24,7 +24,7 @@ def set_seed(seed):
 
 def to_device(x,  device):
     if isinstance(x, torch.Tensor):
-        return x.to(device, non_blocking=True) if x.device != device is not None else x
+        return x.to(device, non_blocking=True) if x.device != device else x
     elif isinstance(x, (list,  tuple)):
         return [to_device(x_, device) for x_ in x]
     elif isinstance(x, dict):

@@ -169,102 +169,119 @@ class PINNTrainer(TrainerBase):
         
         # Get normalized outputs from model
         u_pred = model(inputs_tensor)
-        
-        # Get dimensions
+
+        # Get dimensions first
         batch_size = inputs_tensor.shape[0]
         x_dim = self.equation.x_domain.shape[0]
-        
-        # Extract time and spatial coordinates
-        t = inputs_tensor[:, 0:1]
-        x = inputs_tensor[:, 1:1+x_dim]
-        
-        # Get gradients for PDE terms
-        u_t = autograd.grad(
-            u_pred, t, 
-            grad_outputs=torch.ones_like(u_pred),
-            create_graph=True, retain_graph=True
-        )[0]
-        
+            
         # Compute different loss terms based on the equation type
-        pde_loss = 0
         equation_type = self.config.equation
+        pde_loss = 0
         
+        # Note: The original t and x slicings are removed as derivatives are now
+        # calculated w.r.t. the whole inputs_tensor and then components are extracted.
+        # t = inputs_tensor[:, 0:1] # No longer used this way
+        # x = inputs_tensor[:, 1:1+x_dim] # No longer used this way
+
         if equation_type == "heat":
-            # Heat equation: u_t = u_xx + u_yy
-            u_x = autograd.grad(
-                u_pred, x,
+            # Calculate all first-order derivatives of u_pred w.r.t. inputs_tensor
+            # inputs_tensor is a leaf and requires_grad=True
+            all_first_order_grads = autograd.grad(
+                u_pred, inputs_tensor,
                 grad_outputs=torch.ones_like(u_pred),
-                create_graph=True, retain_graph=True
+                create_graph=True, # Must be true to compute higher-order derivatives
+                retain_graph=True  # Keep graph for subsequent grad calls if any, or if u_pred is used elsewhere
             )[0]
-            
-            u_xx = 0
+
+            u_t = all_first_order_grads[:, 0:1]
+            # u_x_components contains [du/dx_spatial_0, du/dx_spatial_1, ...]
+            u_x_components = all_first_order_grads[:, 1:1+x_dim]
+
+            u_xx_laplacian = 0
             for i in range(x_dim):
-                u_xi = u_x[:, i:i+1]
-                u_xxi = autograd.grad(
-                    u_xi, x,
-                    grad_outputs=torch.ones_like(u_xi),
-                    create_graph=True, retain_graph=True
-                )[0][:, i:i+1]
-                u_xx += u_xxi
+                # Current component of first spatial derivative (e.g., du/dx_i)
+                du_dxi = u_x_components[:, i:i+1]
+                
+                # Compute its derivative w.r.t. the entire inputs_tensor
+                # This is needed because du_dxi's graph depends on inputs_tensor
+                grad_du_dxi_wrt_inputs = autograd.grad(
+                    du_dxi, inputs_tensor,
+                    grad_outputs=torch.ones_like(du_dxi),
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
+                
+                # Extract the specific second derivative d/dx_i (du/dx_i)
+                # This corresponds to the (1+i)-th column of grad_du_dxi_wrt_inputs
+                u_xxi = grad_du_dxi_wrt_inputs[:, 1+i:1+i+1]
+                u_xx_laplacian += u_xxi
             
-            # Heat equation: u_t = u_xx + u_yy
-            pde_loss = ((u_t - u_xx)**2).mean()
+            # Heat equation: u_t = laplacian(u)
+            pde_loss = ((u_t - u_xx_laplacian)**2).mean()
             
         elif equation_type == "wave":
-            # Wave equation: u_tt = c^2 * (u_xx + u_yy)
-            # For this, we need second time derivative
-            c = 0.1  # From wave_equation.py default parameter
+            c = 0.1
             if hasattr(self, 'equation_kwargs') and 'c' in self.equation_kwargs:
                 c = self.equation_kwargs['c']
-                
-            u_x = autograd.grad(
-                u_pred, x,
+
+            # Calculate all first-order derivatives of u_pred w.r.t. inputs_tensor
+            all_first_order_grads = autograd.grad(
+                u_pred, inputs_tensor,
                 grad_outputs=torch.ones_like(u_pred),
                 create_graph=True, retain_graph=True
             )[0]
-            
-            u_xx = 0
-            for i in range(x_dim):
-                u_xi = u_x[:, i:i+1]
-                u_xxi = autograd.grad(
-                    u_xi, x,
-                    grad_outputs=torch.ones_like(u_xi),
-                    create_graph=True, retain_graph=True
-                )[0][:, i:i+1]
-                u_xx += u_xxi
-            
-            u_tt = autograd.grad(
-                u_t, t,
-                grad_outputs=torch.ones_like(u_t),
-                create_graph=True, retain_graph=True
+
+            u_t_from_all = all_first_order_grads[:, 0:1]
+            u_x_components = all_first_order_grads[:, 1:1+x_dim]
+
+            # Calculate u_tt (second time derivative)
+            grad_ut_wrt_inputs = autograd.grad(
+                u_t_from_all, inputs_tensor,
+                grad_outputs=torch.ones_like(u_t_from_all),
+                create_graph=True,
+                retain_graph=True
             )[0]
+            u_tt = grad_ut_wrt_inputs[:, 0:1]
+
+            # Calculate u_xx_laplacian (sum of second spatial derivatives)
+            u_xx_laplacian = 0
+            for i in range(x_dim):
+                du_dxi = u_x_components[:, i:i+1]
+                grad_du_dxi_wrt_inputs = autograd.grad(
+                    du_dxi, inputs_tensor,
+                    grad_outputs=torch.ones_like(du_dxi),
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
+                u_xxi = grad_du_dxi_wrt_inputs[:, 1+i:1+i+1]
+                u_xx_laplacian += u_xxi
             
-            # Wave equation: u_tt = c^2 * (u_xx + u_yy)
-            pde_loss = ((u_tt - (c**2) * u_xx)**2).mean()
+            pde_loss = ((u_tt - (c**2) * u_xx_laplacian)**2).mean()
             
         elif equation_type == "poisson":
-            # Poisson equation: -laplacian(u) = f
-            u_x = autograd.grad(
-                u_pred, x,
+            # Poisson equation: -laplacian(u) = f (here simplified to -laplacian(u) = 0)
+            all_first_order_grads = autograd.grad(
+                u_pred, inputs_tensor,
                 grad_outputs=torch.ones_like(u_pred),
                 create_graph=True, retain_graph=True
             )[0]
-            
-            u_xx = 0
+
+            u_x_components = all_first_order_grads[:, 1:1+x_dim]
+
+            u_xx_laplacian = 0
             for i in range(x_dim):
-                u_xi = u_x[:, i:i+1]
-                u_xxi = autograd.grad(
-                    u_xi, x,
-                    grad_outputs=torch.ones_like(u_xi),
-                    create_graph=True, retain_graph=True
-                )[0][:, i:i+1]
-                u_xx += u_xxi
+                du_dxi = u_x_components[:, i:i+1]
+                grad_du_dxi_wrt_inputs = autograd.grad(
+                    du_dxi, inputs_tensor,
+                    grad_outputs=torch.ones_like(du_dxi),
+                    create_graph=True,
+                    retain_graph=True
+                )[0]
+                u_xxi = grad_du_dxi_wrt_inputs[:, 1+i:1+i+1]
+                u_xx_laplacian += u_xxi
             
-            # Create a simplified version of the forcing term
-            # Note: This is an approximation and may need to be adapted
-            # for the specific Poisson equation implementation
-            pde_loss = ((u_xx)**2).mean()
-            
+            pde_loss = ((u_xx_laplacian)**2).mean()
+        
         return pde_loss
     
     def fit(self):
